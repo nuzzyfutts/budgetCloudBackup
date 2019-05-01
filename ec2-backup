@@ -1,0 +1,320 @@
+#!/usr/pkg/bin/python3.7
+
+from subprocess import check_output, run, Popen, PIPE, CalledProcessError, STDOUT, DEVNULL
+from time import sleep
+from math import ceil
+import boto3 as aws
+import argparse
+import atexit
+import pprint
+import json
+import sys
+import os
+
+# NetBSD
+amis = {"us-east-1": "ami-bc8fc8d6", "us-west-1": "ami-7b0b621b", "us-west-2": "ami-9c9f8ffd", "eu-central-1": "ami-32e6f45e", "eu-west-1": "ami-ac983ddf", "ap-southeast-1": "ami-c8ea2bab", "ap-southeast-2": "ami-8a89d0e9", "ap-northeast-1": "ami-d7eeccb9", "sa-east-1": "ami-51d0553d"}
+
+# Instance variables
+INSTANCE_TYPE = "t1.micro"
+KEY_NAME = "ec2-backup"
+SECURITY_GROUP_NAME = "default"
+INSTANCE_COUNT = 1
+INSTANCE_QUERY = 'Instances[0]'
+
+# Instantiate needed vars
+volumeID = None
+mainRegion = None
+mainVolume = None
+mainInstance = None
+
+# Set verbose printing flag based on environment variable
+if os.environ.get("EC2_BACKUP_VERBOSE") is None:
+	verboseFlag = False
+else:
+	verboseFlag = True
+
+instanceFlags = os.environ.get("EC2_BACKUP_FLAGS_AWS")
+
+def sshFlagHelper(s):
+	if s[0] == "~":
+		return os.path.expanduser(s)
+	else:
+		return s
+
+# Tilde/home directory expansion for path
+if os.environ.get("EC2_BACKUP_FLAGS_SSH") is None:
+	sshFlags = ''
+else:
+	flagVal = os.environ.get("EC2_BACKUP_FLAGS_SSH").split()
+	sshFlags = ' '.join(map(sshFlagHelper, flagVal))
+
+
+#==============================================================================
+#                         Args, Errors, and Commands
+#==============================================================================
+
+"""
+Gracefully handle exceptions and error out with printed info
+"""
+def handleError(e):
+	print(f"ERROR:\nec2-backup: {e}", file=sys.stderr)
+	sys.exit(1)
+
+"""
+If verbose mode is on, print extra info
+"""
+def verbosePrint(s):
+	if verboseFlag:
+		print(s)
+
+"""
+Add arguments to parser and capture arguments
+"""
+def parseArgs():
+	parser = argparse.ArgumentParser(description="ec2-backup creates a usable EC2 instance, creates and attaches the volume, logs in to the instance, and prints out information of the attached disk. If a volume is specified, then the program will use that specified volume instead.")
+	parser.add_argument("-v",required=False,metavar="volume-id",help="Use a specified volume rather than creating a new one.")
+	parser.add_argument("dir",nargs=1,help="Which directory to backup to the EBS volume")
+	return parser.parse_args()
+
+"""
+Execute command (ensuring json output), then parse and return output
+"""
+def execAndParseAWSCommand(command):
+	try:
+		output = run(command + " --output json", shell=True, check=True, capture_output=True)
+		return json.loads(output.stdout)
+	except json.JSONDecodeError as e:
+		handleError(f"there was an error parsing the output from an aws command:\n{e}")
+	except CalledProcessError as e:
+		handleError(f"there was an error from executing an aws command:\n{e}")
+	except Exception as e:
+		handleError(f"Something broke:\n{e}")
+
+#==============================================================================
+#                              Volume Functions
+#==============================================================================
+
+"""
+If volume was provided then check if it is in supported region
+"""
+def volumeExistsInAvailableRegion(volumeID):
+	verbosePrint("Checking if the volume exists in a region supported by this program")
+	try:
+		for currRegion in amis:
+			# Instantiate ec2 session
+			currSession = aws.session.Session(region_name=currRegion)
+			ec2 = currSession.resource('ec2')
+			volume = ec2.Volume(volumeID)
+			# if volume is available then return
+			if volume.state == 'available':
+				verbosePrint(f"The volume you provided has been found and is available in {currRegion}")
+				return currRegion, volume
+			# Volume found but isn't available. Error out
+			elif volume.state != 'available':
+				handleError(f"the volume you specified ({volumeID}) was found but isn't currently available. It's current status is {volume.state}")
+		# Volume not found as we iterated over all our supported region
+		handleError(f"the volume you specified ({volumeID}) was not found in any supported region")
+	except Exception as e:
+		handleError(f"Something broke when trying to retrieve volume and region:\n{e}")
+
+"""
+Check if the provided volume is big enough
+"""
+def checkVolume(volume, dirSize):
+	if volume.size < dirSize:
+		handleError(f"The volume you provided is not big enough to fit the directory you specified")
+	return True
+
+"""
+Create a volume if one hasn't been specified (wait for availability to end )
+"""
+def createVolume(region, dirSize, instance):
+	verbosePrint("A volume was not specified. Creating one now...")
+	try:
+		# Instantiate ec2 session
+		currSession = aws.session.Session(region_name=region)
+		ec2 = currSession.resource("ec2")
+		# Create and wait for volume to be available
+		volume = ec2.create_volume(AvailabilityZone=instance.placement['AvailabilityZone'], Size=dirSize, VolumeType='standard')
+		ec2Client = currSession.client('ec2')
+		ec2Client.get_waiter('volume_available').wait(VolumeIds=[volume.volume_id])
+		verbosePrint(f"A volume of size {dirSize} GiB has been successfully created!")
+		return volume
+	except Exception as e:
+		handleError(f"Ran into an error when trying to create a volume in {region}\n{e}")
+
+"""
+Attach volume to instance, and wait for it to be fully attached before ending
+"""
+def attachVolume(volume, instanceID, region):
+	verbosePrint("Now attaching the volume onto the instance")
+	try:
+		# Instantiate ec2 session for region
+		currSession = aws.session.Session(region_name=region)
+		ec2Client = currSession.client('ec2')
+		volume.attach_to_instance(Device="/dev/sdx",InstanceId=instanceID)
+		# Wait for volume to be fully attached and usable with instance
+		ec2Client.get_waiter('volume_in_use').wait(VolumeIds=[volume.volume_id])
+		verbosePrint(f"The volume has been successfully attached to the instance")
+	except Exception as e:
+		handleError(f"Ran into an error while trying to attach the volume to the EC2 Instance.\n{e}")
+
+#==============================================================================
+#                               Data Functions
+#==============================================================================
+
+"""
+Ensure that the directory is less than size limit and can be read from
+"""
+def directoryExists(directory):
+	verbosePrint(f"Now checking if the directory exists and fits all constraints")
+	try:
+		if not os.path.isdir(directory):
+			handleError(f"the directory {dir} does not exist")
+		if not os.access(directory, os.R_OK):
+			handleError(f"the directory cannot be read from")
+		size = ceil(float(check_output(['du','-sg', directory]).split()[0].decode('utf-8')) * 0.9313226)
+		if (size > 1023):
+			handleError(f"The maximum possible size for a directory is 1024 GiB. The directory you specified is {size} GiB.")
+		verbosePrint(f"The directory is valid, can be read from and fits the size constraint!")
+		return size
+	except CalledProcessError as e:
+		handleError(f"The program cannot retrieve the size of the directory. Ensure you have access to everything in the directory.\n{e}")
+	except Exception as e:
+		handleError(f"An unknown error occurred.\n{e}")
+
+"""
+FULLY ensure that instance is ready then copy over data
+"""
+def copyData(directory, instance, region):
+	verbosePrint("Initializing copying of data over to the EBS volume")
+	try:
+		currSession = aws.session.Session(region_name=region)
+		ec2 = currSession.resource('ec2')
+		instance = ec2.Instance(instance.instance_id)
+		instance.wait_until_running()
+
+		# NetBSD for some reason is "available" on EC2 (according to the waiter
+		# and the describe-instance-status command) before you can actually SSH
+		# into it. So I have to manually sleep the program for it to be ready.
+		verbosePrint(f"NetBSD is weird on AWS and isn't available for SSH when it's 'available'.\nFor that reason, we have to wait longer. Apologies")
+		sleep(35)
+
+		cmd = f"tar cf - {directory} | ssh {sshFlags or ''} root@{instance.public_dns_name} 'dd of=/dev/xbd2d'"
+		run(cmd, shell=True, check=True, stdout=STDOUT if verbosePrint else DEVNULL, stderr=STDOUT)
+		verbosePrint(f"The data has been copied to the EBS volume")
+	except CalledProcessError as e:
+		handleError(f'An error occurred when trying to run the ssh process\n{e}')
+	except Exception as e:
+		handleError(f'An error occurred when trying to ssh\n{e}')
+
+#==============================================================================
+#                             Instance Functions
+#==============================================================================
+
+"""
+Create the instance, wait for it to fully boot up, and return instance info
+"""
+def createAndRunInstance(region, volume=None):
+	verbosePrint("Creating the instance...")
+	try:
+		# If no volume provided, obtain region from AWSCLI config
+		if volume == None:
+			session = aws.session.Session()
+			region = session.region_name
+		
+		# This shouldn't trigger but is here for failsafe as this is 
+		# checked elsewhere
+		if region not in amis:
+			handleError(f"The region specified in your config ({region}) is not supported by this program")
+		
+		command = f"aws ec2 run-instances --count {INSTANCE_COUNT} --instance-type {INSTANCE_TYPE} --key-name {KEY_NAME} --security-groups {SECURITY_GROUP_NAME} --query '{INSTANCE_QUERY}' --image-id {amis[region]}"
+
+		# Specify region and placement if volume not given to ensure no issues 
+		# with volume vailability to instance
+		if volume != None:
+			command += f" --region {region} --placement 'AvailabilityZone={volume.availability_zone}' --image-id {amis[region]}"
+
+		# Get instance info, wait for it to boot, reload for availability of 
+		# DNS name and all info.
+		command += f" '{instanceFlags or ''}' "
+		instanceInfo = execAndParseAWSCommand(command)
+
+		currSession = aws.session.Session(region_name=region)
+		ec2 = currSession.resource('ec2')
+
+		instance = ec2.Instance(instanceInfo['InstanceId'])
+		instance.wait_until_running()
+		
+		instance.load()
+		verbosePrint(f"The instance is now running at {instance.public_dns_name}")
+		
+		return instance
+	except Exception as e:
+		handleError(f"Ran into an error when trying to create and run the instance\n{e}")
+
+"""
+Detach volume from the instance and terminate the instance
+"""
+@atexit.register
+def cleanup():
+	try:
+		verbosePrint(f"Detaching volume and terminating instance")
+		# Instantiate ec2 instance
+		if mainVolume != None or mainInstance != None:
+			currSession = aws.session.Session(region_name=mainRegion)
+			ec2Client = currSession.client('ec2')
+
+		if mainVolume != None:
+			mainVolume.detach_from_instance()
+			verbosePrint(f"Volume has been detached")
+			ec2Client.get_waiter('volume_available').wait(VolumeIds=[mainVolume.volume_id])
+		
+		if mainInstance != None:
+			mainInstance.terminate()
+			verbosePrint(f"Instance has been terminated")
+	except Exception as e:
+		handleError(f"Ran into an error when trying to detach the volume or terminate the instance\n{e}")
+
+#==============================================================================
+#                                    Main
+#==============================================================================
+
+if __name__ == "__main__":
+	
+	#Parse the args given by the user
+	args = parseArgs()
+	volumeID = args.v
+	directory = args.dir[0]
+	volumeSpecified = False if volumeID == None else True
+
+	# Check if directory exists, is readable and get the required size for the
+	# EBS volume
+	requiredSize = directoryExists(directory)
+	verbosePrint(f"The required size for the EBS volume is {requiredSize} GiB")
+
+	# If the volume is specified, get the region and the volume information of
+	# the volume specified by the user
+	if volumeSpecified:
+		mainRegion, mainVolume = volumeExistsInAvailableRegion(args.v)
+		verbosePrint(f"There was a volume specified. It is in {mainRegion} and is {mainVolume.size}")
+		checkVolume(mainVolume, requiredSize)
+		mainInstance = createAndRunInstance(mainRegion, mainVolume)
+	# If the volume isn't specified, get the region from AWS config and then 
+	# create an instance
+	else:
+		currSession = aws.session.Session()
+		mainRegion = currSession.region_name
+		mainInstance = createAndRunInstance(mainRegion)
+
+	# Because we didn't earlier, create a volume if one wasn't specified
+	if not volumeSpecified:
+		verbosePrint(f"There was no volume specified. Creating one of the required size in {mainRegion}")
+		volume = createVolume(mainRegion, requiredSize, mainInstance)
+
+	# Attach the volume, copy the data, cleanup, and exit
+	attachVolume(mainVolume, mainInstance.instance_id, mainRegion)
+	copyData(directory, mainInstance, mainRegion)
+	cleanup()
+
+	print(mainVolume.volume_id)

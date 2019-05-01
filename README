@@ -1,0 +1,154 @@
+Aimal Wajihuddin
+April 7th, 2019
+CS615A HW 5 - Spring 2019
+Prof. Schaumann
+
+===========================
+    Assignment Solution
+===========================
+
+- Language and tools of choice
+
+I again chose Python (along with boto3 the Python AWS SDK). The biggest reason
+for this was the fact that I wanted to be able to build off of my last program
+and reuse some parts. Although I barely reused anything from the original code
+and ended up rewriting everything.
+
+- The Solution
+
+The program essentially just executes a series of AWS CLI commands, taking the 
+output from all of them, passing it around, and using it to complete the task 
+set forth by the assignment specification. The steps are as follows:
+	1.  Checks the environment for any designated variables for use by the 
+		program.
+	2.  Takes in a directory, and maybe a designated volume.
+		a. It ensures the directory fits the size/read permission constraints.
+		b. If a volume is provided, ensures it fits the directory.
+		c. If a volume isn't provided, it creates one that fits the constraints.
+	3.  Creates the (NetBSD) instance.
+		a. If a volume (and therefore region) isn't given, then it creates one 
+		in the default AWS CLI configured region. 
+	4. It attaches the volume, and then copies over the data (after sleeping).
+	5. After data is copied, it detaches the volume and terminates the instance.
+
+
+- Running the program
+
+As the assignment spec suggests, you simply execute `make install`. This will
+install all required packages and move files to the correct directories.
+This also makes the file executable. So in order to the run the program you 
+will need to execute the following commands:
+
+make install
+/usr/local/bin/ec2-backup <args>
+
+This of course depends on the assumption that the SSH credentials and config 
+have been set up with ec2-backup and the ec2-backup-prep script has been ran
+
+==============================
+    Learning from Mistakes
+==============================
+
+```
+	>I then specified '-i ~/.ssh/config' in the ssh
+	>command in the file. After this change, the program
+	>was able to ssh into the instance.
+
+	This does not seem right.  '-i' is used to specify the
+	private key; ~/.ssh/config should be the configuration
+	file.
+```
+
+I am still not sure why I had to resort to this last time. Maybe it was sleep 
+deprivation getting the best of me, but I didn't have to resort to `-i` at all
+this time. It worked right off of the bat
+
+```
+      > #Parse the args given by the user
+      > args = parseArgs()
+
+	This is an example of a 'useless comment'.  Comments
+	should explain why you're doing something, not what
+	you're doing.  Try to avoid this in the future.
+```
+
+I realize that this is a useless comment. I tried to get rid of most of these 
+but I still have some in my code that you might consider "useless". I still 
+included these mostly out of a stylistic choice as I prefer those comments to 
+be in there. It doesn't add too much space.
+
+There are some areas that could do with a comment to explain what's going on,
+but because I have verboseFlag based print statements everywhere that
+essentially achieve the same purpose, there are some functions without 
+comments.
+
+```
+       > except json.JSONDecodeError as e:
+       >     print(f"ec2-backup-v1 error: there was an error 
+
+	Error should go to stderr, not stdout.
+```
+
+I now print out to stderr and use sys.exit(1) as well.
+
+```
+	> print(run(f"ssh -i ~/.ssh/ec2-backup.pem root@{ipAddress} '/sbin/disklabel
+
+	Specifying '-i' should not be required.  In fact, it
+	may be wrong: the keypair named 'ec2-backup' in my EC2
+	account may be stored as something different
+	altogether on my file system.  Per instructions, rely
+	on ~/.ssh/config to be set up correctly as shown on
+	the mailing list.
+```
+
+See comment above regarding -i
+
+```
+> $ ./ec2-backup-v1  -v vol-0bb02e2015e77e2f0       
+> `ec2-backup-v1 error: there was an error parsing the
+> output from an aws command:
+> Expecting value: line 1 column 1 (char 0)
+
+Assumes json output of AWS tools; if you need json
+output, you need to specify that.
+```
+
+I added the --output json to ensure json output this time to prevent any errors.
+
+============================
+    Encountered Problems
+============================
+
+I ran into no small amount of issues with this assignment. Most of them had to 
+do with the fact that NetBSD on AWS is really weird...
+
+When I first tried to run the program, it wouldn't run because OpenSSL 1.0.1
+is going to be EOL soon. I didn't think that trying to upgrade was worth it so 
+I just forced the install of a older version of the python package cryptography
+that uses OpenSSL.
+
+Another weird thing I ran into was the that I had to where I was sending the 
+data in the dd command. In the slides and the assignment spec, it was to 
+/dev/xbd2, but when I looked into it further and tried to get the data back, I
+found that it didn't work and had to use /dev/xbd2d.
+
+Another issue that I ran into was one that was very popular on the mailing list,
+home directory expansion. Python has a really nice way of doing this with
+os.path.expanduser(1). It essentially expands the home directory properly
+when given a path with a "~".
+
+The biggest issue that I ran into, BY FAR, was with waiting for the instance to 
+be ready. Boto3 has waiters that you can use so that you can wait for the 
+instance to be ready before you use them at all, which is great. However, these 
+waiters would pass before I could actually SSH into the NetBSD instance. The 
+reason this was annoying was the fact that it only failed _sometimes_. 
+It worked about 60/40.
+
+It took me FOREVER to figure out what was wrong due to the pipes being used. 
+The working parts in that command caused me to pull my hair out. I even tried
+implementing my old waitForInstanceToBoot() function and that still didn't work.
+Why this was happening, I had no idea. Eventually I just gave up on that and 
+manually implemented a 35 second wait (I know that's a lot) but I'd rather 
+the program take longer to execute rather than only work sometimes.
+
